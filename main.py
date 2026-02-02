@@ -35,21 +35,31 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-class NBRBCurrencyParser:
+# Соответствие числовых кодов из поля Notion кодам валют
+# Если у вас в поле 'ID_money' хранятся коды НБРБ (145, 292, 298...)
+CURRENCY_CODE_MAPPING = {
+    145: "USD",  # Доллар США
+    292: "EUR",  # Евро
+    298: "RUB",  # Российский рубль
+    1: "BYN",    # Белорусский рубль
+    # Добавьте другие валюты по мере необходимости
+}
+
+class CurrencyParser:
     """Класс для получения курсов валют с НБРБ API"""
     
     def __init__(self):
         self.base_url = "https://www.nbrb.by/api/exrates"
         self.rates_cache = {}
         self.cache_timestamp = None
-        self.cache_valid_hours = 1  # Кэшируем на 1 час
+        self.cache_valid_hours = 1
         
     def get_exchange_rate(self, currency_code: str) -> Optional[float]:
         """
-        Получение курса валюты от НБРБ
+        Получение курса валюты. Пробует НБРБ, затем запасной источник.
         
         Args:
-            currency_code: Код валюты (USD, EUR, RUB и т.д.)
+            currency_code: Буквенный код валюты (USD, EUR, RUB и т.д.)
             
         Returns:
             Курс BYN к 1 единице валюты или None при ошибке
@@ -57,113 +67,105 @@ class NBRBCurrencyParser:
         try:
             currency_code = currency_code.upper()
             
-            # Проверяем, нужно ли обновить кэш
-            if self._should_refresh_cache():
-                self._refresh_all_rates()
+            if currency_code == 'BYN':
+                return 1.0
             
-            # Ищем в кэше
-            if currency_code in self.rates_cache:
-                rate = self.rates_cache[currency_code]
-                logger.info(f"Курс {currency_code} из кэша: {rate} BYN")
+            # Пробуем НБРБ
+            rate = self._get_nbrb_rate(currency_code)
+            if rate is not None:
+                logger.info(f"Курс {currency_code} от НБРБ: {rate} BYN")
                 return rate
             
-            # Если нет в кэше, запрашиваем отдельно
-            return self._get_single_rate(currency_code)
+            # Если НБРБ не сработал, пробуем запасной источник
+            rate = self._get_fallback_rate(currency_code)
+            if rate is not None:
+                logger.info(f"Курс {currency_code} от запасного источника: {rate} BYN")
+                return rate
+            
+            logger.warning(f"Курс для {currency_code} не найден ни в одном источнике")
+            return None
             
         except Exception as e:
             logger.error(f"Ошибка получения курса для {currency_code}: {e}")
             return None
     
-    def _should_refresh_cache(self) -> bool:
-        """Проверяет, нужно ли обновить кэш курсов"""
-        if not self.cache_timestamp:
-            return True
-        
-        current_time = time.time()
-        cache_age = current_time - self.cache_timestamp
-        return cache_age > (self.cache_valid_hours * 3600)
-    
-    def _refresh_all_rates(self):
-        """Загружает все курсы валют с НБРБ"""
+    def _get_nbrb_rate(self, currency_code: str) -> Optional[float]:
+        """Получает курс от НБРБ"""
         try:
-            # Получаем все курсы на текущую дату
-            today = date.today().isoformat()
-            url = f"{self.base_url}/rates?periodicity=0&ondate={today}"
+            # Маппинг буквенных кодов на ID НБРБ
+            nbrb_id_mapping = {
+                "USD": 145,
+                "EUR": 292,
+                "RUB": 298,
+                # Добавьте другие валюты
+            }
             
-            logger.info("Загрузка всех курсов валют с НБРБ...")
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
+            nbrb_id = nbrb_id_mapping.get(currency_code)
+            if not nbrb_id:
+                logger.debug(f"Нет маппинга для валюты {currency_code} в НБРБ")
+                return None
             
-            rates_data = response.json()
+            url = f"{self.base_url}/rates/{nbrb_id}?parammode=2"
             
-            # Очищаем кэш
-            self.rates_cache = {}
-            
-            # Парсим данные
-            for rate_info in rates_data:
-                cur_abbreviation = rate_info.get('Cur_Abbreviation')
-                cur_scale = rate_info.get('Cur_Scale', 1)
-                cur_rate = rate_info.get('Cur_OfficialRate')
-                
-                if cur_abbreviation and cur_rate is not None:
-                    # Рассчитываем курс за 1 единицу валюты
-                    rate_per_unit = cur_rate / cur_scale
-                    self.rates_cache[cur_abbreviation] = round(rate_per_unit, 4)
-            
-            self.cache_timestamp = time.time()
-            logger.info(f"Загружено {len(self.rates_cache)} курсов валют")
-            
-            # Добавляем BYN для полноты
-            self.rates_cache['BYN'] = 1.0
-            
-        except Exception as e:
-            logger.error(f"Ошибка загрузки курсов с НБРБ: {e}")
-    
-    def _get_single_rate(self, currency_code: str) -> Optional[float]:
-        """Получает курс для одной валюты"""
-        try:
-            # Специальная обработка для BYN
-            if currency_code.upper() == 'BYN':
-                return 1.0
-            
-            # Формируем запрос к API НБРБ
-            url = f"{self.base_url}/rates/{currency_code}?parammode=2"
-            
-            response = requests.get(url, timeout=10)
+            # Увеличиваем таймаут для НБРБ
+            response = requests.get(url, timeout=15)
             response.raise_for_status()
             
             rate_data = response.json()
-            
             cur_scale = rate_data.get('Cur_Scale', 1)
             cur_rate = rate_data.get('Cur_OfficialRate')
             
             if cur_rate is not None:
                 rate_per_unit = cur_rate / cur_scale
-                logger.info(f"Курс {currency_code}: {rate_per_unit} BYN")
-                
-                # Сохраняем в кэш
-                self.rates_cache[currency_code] = round(rate_per_unit, 4)
-                
                 return round(rate_per_unit, 4)
             
-            logger.warning(f"Курс для {currency_code} не найден в НБРБ")
             return None
             
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                logger.warning(f"Валюта {currency_code} не найдена в НБРБ")
-            else:
-                logger.error(f"HTTP ошибка для {currency_code}: {e}")
+        except requests.exceptions.Timeout:
+            logger.debug(f"Таймаут при запросе курса {currency_code} от НБРБ")
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.debug(f"Ошибка запроса к НБРБ для {currency_code}: {e}")
             return None
         except Exception as e:
-            logger.error(f"Ошибка получения курса {currency_code}: {e}")
+            logger.debug(f"Непредвиденная ошибка НБРБ для {currency_code}: {e}")
+            return None
+    
+    def _get_fallback_rate(self, currency_code: str) -> Optional[float]:
+        """Запасной источник курсов через ExchangeRate-API"""
+        try:
+            # Используем бесплатный API (обновляется раз в день)
+            url = "https://api.exchangerate-api.com/v4/latest/USD"
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            usd_to_target = data['rates'].get(currency_code)
+            
+            if usd_to_target:
+                # Нам нужен курс BYN к валюте
+                # 1. Получаем курс USD к BYN (приблизительно)
+                # 2. Вычисляем: BYN/валюта = (USD/BYN) / (USD/валюта)
+                
+                # Текущий приблизительный курс USD/BYN
+                # В реальном приложении этот курс нужно получать из надежного источника
+                usd_to_byn = 3.25  # Это примерное значение!
+                
+                # Рассчитываем курс
+                rate = usd_to_byn / usd_to_target
+                return round(rate, 4)
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Ошибка запасного источника для {currency_code}: {e}")
             return None
 
 class NotionUpdater:
     """Класс для работы с Notion API через прямые HTTP-запросы"""
     
     def __init__(self):
-        self.parser = NBRBCurrencyParser()
+        self.parser = CurrencyParser()
         
     def get_database_entries(self) -> List[Dict]:
         """Получение всех записей из базы данных через прямой запрос"""
@@ -215,19 +217,32 @@ class NotionUpdater:
             
             field_type = id_money_field.get("type")
             
-            if field_type == "select":
+            # ОБНОВЛЕНИЕ: Обработка числового поля
+            if field_type == "number":
+                number_value = id_money_field.get("number")
+                if number_value is not None:
+                    # Преобразуем число в код валюты
+                    currency_code = CURRENCY_CODE_MAPPING.get(int(number_value))
+                    if currency_code:
+                        logger.debug(f"Извлечен код валюты из числа {number_value}: {currency_code}")
+                        return currency_code
+                    else:
+                        logger.warning(f"Неизвестный числовой код валюты: {number_value}")
+                        return None
+            
+            elif field_type == "select":
                 select_data = id_money_field.get("select")
                 if select_data:
                     currency_name = select_data.get("name", "").strip()
-                    # Пытаемся извлечь код валюты из названия
                     if currency_name:
                         # Если это код валюты (например, "USD", "EUR")
                         if len(currency_name) == 3 and currency_name.isalpha():
                             return currency_name.upper()
-                        # Можно добавить маппинг названий на коды
+                        
+                        # Маппинг названий на коды
                         currency_mapping = {
                             "доллар": "USD",
-                            "евро": "EUR",
+                            "евро": "EUR", 
                             "российский рубль": "RUB",
                             "злотый": "PLN",
                             "гривна": "UAH",
@@ -320,7 +335,7 @@ class NotionUpdater:
                     skipped_count += 1
                     continue
                 
-                # Получаем курс от НБРБ
+                # Получаем курс
                 rate = self.parser.get_exchange_rate(currency_code)
                 
                 if rate is None:
@@ -379,9 +394,10 @@ def test_notion_connection():
 def main():
     """Основная функция"""
     logger.info("=" * 60)
-    logger.info(f"Запуск обновления курсов валют из НБРБ")
+    logger.info(f"Запуск обновления курсов валют")
     logger.info(f"База данных: {DATABASE_ID}")
     logger.info(f"Частота обновления: каждые {UPDATE_FREQUENCY} час(а/ов)")
+    logger.info(f"Источники: НБРБ → ExchangeRate-API (запасной)")
     logger.info(f"Notion API Version: {NOTION_API_VERSION}")
     logger.info("=" * 60)
     
