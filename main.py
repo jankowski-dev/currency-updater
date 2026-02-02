@@ -46,6 +46,85 @@ CURRENCY_CODE_MAPPING = {
 }
 
 class CurrencyParser:
+    """Класс для получения курсов валют с API Беларусбанка"""
+    
+    def __init__(self):
+        self.base_url = "https://belarusbank.by/api/kursExchange"
+        self.rates_cache = {}
+        self.cache_timestamp = None
+        self.cache_valid_hours = 1
+        
+    def get_exchange_rate(self, currency_code: str) -> Optional[float]:
+        try:
+            currency_code = currency_code.upper()
+            if currency_code == 'BYN':
+                return 1.0
+            
+            # Проверяем кэш
+            if self._should_refresh_cache():
+                self._refresh_rates()
+            
+            # Ищем курс в кэше
+            if currency_code in self.rates_cache:
+                logger.info(f"Курс {currency_code} из кэша: {self.rates_cache[currency_code]} BYN")
+                return self.rates_cache[currency_code]
+            
+            logger.warning(f"Курс для {currency_code} не найден в ответе банка")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения курса {currency_code}: {e}")
+            return None
+    
+    def _should_refresh_cache(self) -> bool:
+        if not self.cache_timestamp:
+            return True
+        return (time.time() - self.cache_timestamp) > (self.cache_valid_hours * 3600)
+    
+    def _refresh_rates(self):
+        """Загружает курсы с API Беларусбанка"""
+        try:
+            logger.info("Загрузка курсов с Беларусбанка...")
+            # Город можно поменять или убрать параметр совсем
+            response = requests.get(f"{self.base_url}?city=Минск", timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            
+            if not data or not isinstance(data, list):
+                raise ValueError("Неверный формат ответа от банка")
+            
+            # Очищаем кэш
+            self.rates_cache = {}
+            
+            # Маппинг наших кодов на поля в ответе банка
+            bank_field_mapping = {
+                'USD': 'USD_in',   # Покупка доллара
+                'EUR': 'EUR_in',   # Покупка евро
+                'RUB': 'RUB_in',   # Покупка рубля
+                # Добавьте другие валюты при необходимости
+                # 'GBP': 'GBP_in',
+                # 'CNY': 'CNY_in',
+            }
+            
+            # Банк возвращает массив, берем первый элемент
+            bank_data = data[0]
+            
+            for our_code, bank_field in bank_field_mapping.items():
+                if bank_field in bank_data:
+                    try:
+                        rate = float(bank_data[bank_field])
+                        self.rates_cache[our_code] = rate
+                    except (ValueError, TypeError):
+                        logger.warning(f"Не удалось преобразовать курс для {our_code}")
+            
+            self.cache_timestamp = time.time()
+            logger.info(f"Загружено {len(self.rates_cache)} курсов")
+            
+        except requests.exceptions.Timeout:
+            logger.error("Таймаут при запросе к API Беларусбанка")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки курсов: {e}")
+            
     """Класс для получения курсов валют с НБРБ API"""
     
     def __init__(self):
