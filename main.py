@@ -3,7 +3,6 @@ import logging
 import time
 import requests
 import json
-from notion_client import Client
 from typing import Dict, Optional, List
 from datetime import datetime, date
 
@@ -26,6 +25,15 @@ if not NOTION_TOKEN:
 if not DATABASE_ID:
     logger.error("DATABASE_ID не установлен в переменных окружения")
     exit(1)
+
+# Константы для Notion API
+NOTION_API_VERSION = "2022-06-28"
+NOTION_API_BASE_URL = "https://api.notion.com/v1"
+HEADERS = {
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Notion-Version": NOTION_API_VERSION,
+    "Content-Type": "application/json"
+}
 
 class NBRBCurrencyParser:
     """Класс для получения курсов валют с НБРБ API"""
@@ -152,41 +160,47 @@ class NBRBCurrencyParser:
             return None
 
 class NotionUpdater:
-    """Класс для работы с Notion API"""
+    """Класс для работы с Notion API через прямые HTTP-запросы"""
     
     def __init__(self):
-        self.notion = Client(auth=NOTION_TOKEN)
         self.parser = NBRBCurrencyParser()
         
     def get_database_entries(self) -> List[Dict]:
-        """Получение всех записей из базы данных"""
+        """Получение всех записей из базы данных через прямой запрос"""
         try:
             logger.info(f"Получение записей из базы данных {DATABASE_ID}")
             
+            url = f"{NOTION_API_BASE_URL}/databases/{DATABASE_ID}/query"
             all_pages = []
             has_more = True
             next_cursor = None
             
             while has_more:
-                query_params = {
-                    "database_id": DATABASE_ID,
+                payload = {
                     "page_size": 100
                 }
                 
                 if next_cursor:
-                    query_params["start_cursor"] = next_cursor
+                    payload["start_cursor"] = next_cursor
                 
-                response = self.notion.databases.query(**query_params)
+                response = requests.post(url, headers=HEADERS, json=payload, timeout=30)
+                response.raise_for_status()
+                data = response.json()
                 
-                all_pages.extend(response.get("results", []))
-                has_more = response.get("has_more", False)
-                next_cursor = response.get("next_cursor")
+                all_pages.extend(data.get("results", []))
+                has_more = data.get("has_more", False)
+                next_cursor = data.get("next_cursor")
             
             logger.info(f"Найдено {len(all_pages)} записей")
             return all_pages
             
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             logger.error(f"Ошибка получения данных из Notion: {e}")
+            if hasattr(e.response, 'text'):
+                logger.error(f"Ответ сервера: {e.response.text}")
+            return []
+        except Exception as e:
+            logger.error(f"Непредвиденная ошибка: {e}")
             return []
     
     def extract_currency_code(self, page_properties: Dict) -> Optional[str]:
@@ -254,21 +268,31 @@ class NotionUpdater:
             return None
     
     def update_page_rate(self, page_id: str, rate: float) -> bool:
-        """Обновление курса в записи Notion"""
+        """Обновление курса в записи Notion через PATCH запрос"""
         try:
-            self.notion.pages.update(
-                page_id=page_id,
-                properties={
+            url = f"{NOTION_API_BASE_URL}/pages/{page_id}"
+            
+            payload = {
+                "properties": {
                     "Money_rate": {
                         "number": rate
                     }
                 }
-            )
+            }
+            
+            response = requests.patch(url, headers=HEADERS, json=payload, timeout=30)
+            response.raise_for_status()
+            
             logger.debug(f"Обновлена запись {page_id} с курсом {rate}")
             return True
             
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             logger.error(f"Ошибка обновления записи {page_id}: {e}")
+            if hasattr(e.response, 'text'):
+                logger.error(f"Ответ сервера: {e.response.text}")
+            return False
+        except Exception as e:
+            logger.error(f"Непредвиденная ошибка при обновлении: {e}")
             return False
     
     def process_database(self):
@@ -312,7 +336,7 @@ class NotionUpdater:
                     error_count += 1
                 
                 # Небольшая пауза, чтобы не превысить лимиты API
-                time.sleep(0.05)
+                time.sleep(0.1)
                 
             except Exception as e:
                 logger.error(f"Ошибка обработки записи {page.get('id', 'unknown')}: {e}")
@@ -323,13 +347,49 @@ class NotionUpdater:
         
         return updated_count
 
+def test_notion_connection():
+    """Тестирование подключения к Notion API"""
+    logger.info("Тестирование подключения к Notion API...")
+    
+    try:
+        # Тест 1: Проверка доступности базы данных
+        url = f"{NOTION_API_BASE_URL}/databases/{DATABASE_ID}"
+        response = requests.get(url, headers=HEADERS, timeout=30)
+        response.raise_for_status()
+        logger.info("✅ База данных доступна")
+        
+        # Тест 2: Проверка прав на запрос
+        url = f"{NOTION_API_BASE_URL}/databases/{DATABASE_ID}/query"
+        payload = {"page_size": 1}
+        response = requests.post(url, headers=HEADERS, json=payload, timeout=30)
+        response.raise_for_status()
+        logger.info("✅ Права на запрос к базе данных подтверждены")
+        
+        return True
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Ошибка подключения к Notion API: {e}")
+        if hasattr(e.response, 'text'):
+            logger.error(f"Ответ сервера: {e.response.text}")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Непредвиденная ошибка: {e}")
+        return False
+
 def main():
     """Основная функция"""
     logger.info("=" * 60)
     logger.info(f"Запуск обновления курсов валют из НБРБ")
     logger.info(f"База данных: {DATABASE_ID}")
     logger.info(f"Частота обновления: каждые {UPDATE_FREQUENCY} час(а/ов)")
+    logger.info(f"Notion API Version: {NOTION_API_VERSION}")
     logger.info("=" * 60)
+    
+    # Проверка подключения перед началом работы
+    if not test_notion_connection():
+        logger.error("Не удалось подключиться к Notion API. Проверьте токен и права доступа.")
+        logger.info("Завершение работы.")
+        return
     
     updater = NotionUpdater()
     
