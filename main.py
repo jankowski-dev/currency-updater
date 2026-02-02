@@ -1,0 +1,366 @@
+import os
+import logging
+import time
+import requests
+import json
+from notion_client import Client
+from typing import Dict, Optional, List
+from datetime import datetime, date
+
+# Настройка логирования
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Конфигурация из переменных окружения
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+DATABASE_ID = os.getenv("DATABASE_ID")
+UPDATE_FREQUENCY = int(os.getenv("UPDATE_FREQUENCY", "1"))
+
+# Проверка обязательных переменных
+if not NOTION_TOKEN:
+    logger.error("NOTION_TOKEN не установлен в переменных окружения")
+    exit(1)
+if not DATABASE_ID:
+    logger.error("DATABASE_ID не установлен в переменных окружения")
+    exit(1)
+
+class NBRBCurrencyParser:
+    """Класс для получения курсов валют с НБРБ API"""
+    
+    def __init__(self):
+        self.base_url = "https://www.nbrb.by/api/exrates"
+        self.rates_cache = {}
+        self.cache_timestamp = None
+        self.cache_valid_hours = 1  # Кэшируем на 1 час
+        
+    def get_exchange_rate(self, currency_code: str) -> Optional[float]:
+        """
+        Получение курса валюты от НБРБ
+        
+        Args:
+            currency_code: Код валюты (USD, EUR, RUB и т.д.)
+            
+        Returns:
+            Курс BYN к 1 единице валюты или None при ошибке
+        """
+        try:
+            currency_code = currency_code.upper()
+            
+            # Проверяем, нужно ли обновить кэш
+            if self._should_refresh_cache():
+                self._refresh_all_rates()
+            
+            # Ищем в кэше
+            if currency_code in self.rates_cache:
+                rate = self.rates_cache[currency_code]
+                logger.info(f"Курс {currency_code} из кэша: {rate} BYN")
+                return rate
+            
+            # Если нет в кэше, запрашиваем отдельно
+            return self._get_single_rate(currency_code)
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения курса для {currency_code}: {e}")
+            return None
+    
+    def _should_refresh_cache(self) -> bool:
+        """Проверяет, нужно ли обновить кэш курсов"""
+        if not self.cache_timestamp:
+            return True
+        
+        current_time = time.time()
+        cache_age = current_time - self.cache_timestamp
+        return cache_age > (self.cache_valid_hours * 3600)
+    
+    def _refresh_all_rates(self):
+        """Загружает все курсы валют с НБРБ"""
+        try:
+            # Получаем все курсы на текущую дату
+            today = date.today().isoformat()
+            url = f"{self.base_url}/rates?periodicity=0&ondate={today}"
+            
+            logger.info("Загрузка всех курсов валют с НБРБ...")
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            
+            rates_data = response.json()
+            
+            # Очищаем кэш
+            self.rates_cache = {}
+            
+            # Парсим данные
+            for rate_info in rates_data:
+                cur_abbreviation = rate_info.get('Cur_Abbreviation')
+                cur_scale = rate_info.get('Cur_Scale', 1)
+                cur_rate = rate_info.get('Cur_OfficialRate')
+                
+                if cur_abbreviation and cur_rate is not None:
+                    # Рассчитываем курс за 1 единицу валюты
+                    rate_per_unit = cur_rate / cur_scale
+                    self.rates_cache[cur_abbreviation] = round(rate_per_unit, 4)
+            
+            self.cache_timestamp = time.time()
+            logger.info(f"Загружено {len(self.rates_cache)} курсов валют")
+            
+            # Добавляем BYN для полноты
+            self.rates_cache['BYN'] = 1.0
+            
+        except Exception as e:
+            logger.error(f"Ошибка загрузки курсов с НБРБ: {e}")
+    
+    def _get_single_rate(self, currency_code: str) -> Optional[float]:
+        """Получает курс для одной валюты"""
+        try:
+            # Специальная обработка для BYN
+            if currency_code.upper() == 'BYN':
+                return 1.0
+            
+            # Формируем запрос к API НБРБ
+            url = f"{self.base_url}/rates/{currency_code}?parammode=2"
+            
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            
+            rate_data = response.json()
+            
+            cur_scale = rate_data.get('Cur_Scale', 1)
+            cur_rate = rate_data.get('Cur_OfficialRate')
+            
+            if cur_rate is not None:
+                rate_per_unit = cur_rate / cur_scale
+                logger.info(f"Курс {currency_code}: {rate_per_unit} BYN")
+                
+                # Сохраняем в кэш
+                self.rates_cache[currency_code] = round(rate_per_unit, 4)
+                
+                return round(rate_per_unit, 4)
+            
+            logger.warning(f"Курс для {currency_code} не найден в НБРБ")
+            return None
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Валюта {currency_code} не найдена в НБРБ")
+            else:
+                logger.error(f"HTTP ошибка для {currency_code}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка получения курса {currency_code}: {e}")
+            return None
+
+class NotionUpdater:
+    """Класс для работы с Notion API"""
+    
+    def __init__(self):
+        self.notion = Client(auth=NOTION_TOKEN)
+        self.parser = NBRBCurrencyParser()
+        
+    def get_database_entries(self) -> List[Dict]:
+        """Получение всех записей из базы данных"""
+        try:
+            logger.info(f"Получение записей из базы данных {DATABASE_ID}")
+            
+            all_pages = []
+            has_more = True
+            next_cursor = None
+            
+            while has_more:
+                query_params = {
+                    "database_id": DATABASE_ID,
+                    "page_size": 100
+                }
+                
+                if next_cursor:
+                    query_params["start_cursor"] = next_cursor
+                
+                response = self.notion.databases.query(**query_params)
+                
+                all_pages.extend(response.get("results", []))
+                has_more = response.get("has_more", False)
+                next_cursor = response.get("next_cursor")
+            
+            logger.info(f"Найдено {len(all_pages)} записей")
+            return all_pages
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения данных из Notion: {e}")
+            return []
+    
+    def extract_currency_code(self, page_properties: Dict) -> Optional[str]:
+        """Извлечение кода валюты из свойств страницы"""
+        try:
+            # Поле с валютой - ID_money
+            id_money_field = page_properties.get("ID_money")
+            
+            if not id_money_field:
+                logger.debug("Поле ID_money не найдено в свойствах")
+                return None
+            
+            field_type = id_money_field.get("type")
+            
+            if field_type == "select":
+                select_data = id_money_field.get("select")
+                if select_data:
+                    currency_name = select_data.get("name", "").strip()
+                    # Пытаемся извлечь код валюты из названия
+                    if currency_name:
+                        # Если это код валюты (например, "USD", "EUR")
+                        if len(currency_name) == 3 and currency_name.isalpha():
+                            return currency_name.upper()
+                        # Можно добавить маппинг названий на коды
+                        currency_mapping = {
+                            "доллар": "USD",
+                            "евро": "EUR",
+                            "российский рубль": "RUB",
+                            "злотый": "PLN",
+                            "гривна": "UAH",
+                            "юань": "CNY",
+                            "белорусский рубль": "BYN",
+                        }
+                        
+                        for key, code in currency_mapping.items():
+                            if key in currency_name.lower():
+                                return code
+            
+            elif field_type == "rich_text":
+                rich_text = id_money_field.get("rich_text", [])
+                if rich_text and len(rich_text) > 0:
+                    text = rich_text[0].get("plain_text", "").strip()
+                    if len(text) == 3 and text.isalpha():
+                        return text.upper()
+            
+            elif field_type == "title":
+                title = id_money_field.get("title", [])
+                if title and len(title) > 0:
+                    text = title[0].get("plain_text", "").strip()
+                    if len(text) == 3 and text.isalpha():
+                        return text.upper()
+            
+            elif field_type == "formula":
+                formula = id_money_field.get("formula")
+                if formula and formula.get("type") == "string":
+                    text = formula.get("string", "").strip()
+                    if len(text) == 3 and text.isalpha():
+                        return text.upper()
+            
+            logger.warning(f"Не удалось извлечь код валюты из поля типа {field_type}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка извлечения кода валюты: {e}")
+            return None
+    
+    def update_page_rate(self, page_id: str, rate: float) -> bool:
+        """Обновление курса в записи Notion"""
+        try:
+            self.notion.pages.update(
+                page_id=page_id,
+                properties={
+                    "Money_rate": {
+                        "number": rate
+                    }
+                }
+            )
+            logger.debug(f"Обновлена запись {page_id} с курсом {rate}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка обновления записи {page_id}: {e}")
+            return False
+    
+    def process_database(self):
+        """Основной метод обработки базы данных"""
+        pages = self.get_database_entries()
+        
+        if not pages:
+            logger.warning("Нет записей для обработки")
+            return
+        
+        updated_count = 0
+        error_count = 0
+        skipped_count = 0
+        
+        for page in pages:
+            try:
+                page_id = page["id"]
+                properties = page.get("properties", {})
+                
+                # Получаем код валюты
+                currency_code = self.extract_currency_code(properties)
+                
+                if not currency_code:
+                    logger.warning(f"Запись {page_id}: не удалось получить код валюты")
+                    skipped_count += 1
+                    continue
+                
+                # Получаем курс от НБРБ
+                rate = self.parser.get_exchange_rate(currency_code)
+                
+                if rate is None:
+                    logger.warning(f"Запись {page_id}: курс для {currency_code} не найден")
+                    error_count += 1
+                    continue
+                
+                # Обновляем запись в Notion
+                if self.update_page_rate(page_id, rate):
+                    updated_count += 1
+                    logger.info(f"Обновлен курс {currency_code} = {rate} BYN для записи {page_id}")
+                else:
+                    error_count += 1
+                
+                # Небольшая пауза, чтобы не превысить лимиты API
+                time.sleep(0.05)
+                
+            except Exception as e:
+                logger.error(f"Ошибка обработки записи {page.get('id', 'unknown')}: {e}")
+                error_count += 1
+        
+        logger.info(f"Обработка завершена. Обновлено: {updated_count}, "
+                   f"Пропущено: {skipped_count}, Ошибок: {error_count}")
+        
+        return updated_count
+
+def main():
+    """Основная функция"""
+    logger.info("=" * 60)
+    logger.info(f"Запуск обновления курсов валют из НБРБ")
+    logger.info(f"База данных: {DATABASE_ID}")
+    logger.info(f"Частота обновления: каждые {UPDATE_FREQUENCY} час(а/ов)")
+    logger.info("=" * 60)
+    
+    updater = NotionUpdater()
+    
+    while True:
+        try:
+            start_time = time.time()
+            
+            updated_count = updater.process_database()
+            
+            execution_time = time.time() - start_time
+            logger.info(f"Выполнение заняло {execution_time:.2f} секунд")
+            
+            if updated_count == 0:
+                logger.info("Нет обновлений для выполнения")
+            
+            # Ждем указанное время до следующего обновления
+            wait_time = UPDATE_FREQUENCY * 3600
+            logger.info(f"Следующее обновление через {UPDATE_FREQUENCY} час(а/ов) "
+                       f"({wait_time / 3600:.1f} часов)")
+            
+            time.sleep(wait_time)
+            
+        except KeyboardInterrupt:
+            logger.info("Получен сигнал прерывания. Завершение работы.")
+            break
+        except Exception as e:
+            logger.error(f"Критическая ошибка в основном цикле: {e}")
+            
+            # В случае ошибки ждем 5 минут перед повторной попыткой
+            logger.info("Повтор через 5 минут")
+            time.sleep(300)
+
+if __name__ == "__main__":
+    main()
